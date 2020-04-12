@@ -6,7 +6,6 @@
 #include <ace/Svc_Handler.h>
 #include <ace/Select_Reactor.h>
 #include <ace/Manual_Event.h>
-#include <vector>
 
 #define IPV6_ONLY_OPT ACE_TEXT("ipv6only")
 #define IPV6_ONLY_OPT_LEN (sizeof(IPV6_ONLY_OPT) / sizeof(ACE_TCHAR) - 1)
@@ -34,11 +33,15 @@ struct Event_Loop_Arg {
 
 static ACE_THR_FUNC_RETURN event_loop(void* p)
 {
-    Event_Loop_Arg* arg = (Event_Loop_Arg*) p;
-
     ACE_Reactor* const reactor = make_reactor <ACE_Select_Reactor> ();
-    arg->reactor = reactor;
-    arg->evt->signal();
+    if (!reactor)
+        return 0;
+
+    {
+        Event_Loop_Arg* arg = (Event_Loop_Arg*) p;
+        arg->reactor = reactor;
+        arg->evt->signal();
+    }
 
     while (!reactor->reactor_event_loop_done()) {
         reactor->run_reactor_event_loop();
@@ -66,6 +69,68 @@ static ACE_Reactor* make_reactor_event_loop(ACE_thread_t& tid)
     evt.wait();
     return arg.reactor;
 }
+
+class Event_Loop_Manager
+{
+public:
+    Event_Loop_Manager(): reactors_(0), tids_(0), n_(0), i_(0)
+    {
+    }
+
+    ~Event_Loop_Manager()
+    {
+        close();
+    }
+
+    bool open(int n)
+    {
+        close();
+
+        ACE_Reactor** r;
+        ACE_NEW_RETURN(r, ACE_Reactor*[n], false);
+        reactors_.reset(r);
+        memset(r, 0, sizeof(ACE_Reactor*) * n);
+
+        ACE_thread_t* t;
+        ACE_NEW_RETURN(t, ACE_thread_t[n], false);
+        tids_.reset(t);
+        memset(t, 0, sizeof(ACE_thread_t*) * n);
+
+        n_ = n;
+
+        for (int i = 0; i < n_; ++i) {
+            reactors_[i] = make_reactor_event_loop(tids_[i]);
+        }
+
+        i_ = 0;
+        return true;
+    }
+
+    void close()
+    {
+        for (int i = 0; i < n_; ++i) {
+            ACE_Thread_Manager::instance()->join(tids_[i]);
+            delete reactors_[i];
+            reactors_[i] = 0;
+        }
+
+        i_ = n_ = 0;
+        reactors_.reset();
+        tids_.reset();
+    }
+
+    ACE_Reactor* reactor()
+    {
+        ACE_Reactor* r = reactors_[i_];
+        i_ = (i_ + 1) % n_;
+        return r;
+    }
+protected:
+    ACE_Auto_Basic_Array_Ptr<ACE_Reactor*> reactors_;
+    ACE_Auto_Basic_Array_Ptr<ACE_thread_t> tids_;
+    int n_;
+    int i_;
+};
 
 class Echo_Handler: public ACE_Svc_Handler<ACE_SOCK_STREAM, ACE_NULL_SYNCH>
 {
@@ -112,14 +177,6 @@ public:
 class Echo_Acceptor: public ACE_Acceptor<Echo_Handler, ACE_SOCK_ACCEPTOR>
 {
 public:
-    virtual ~Echo_Acceptor()
-    {
-        for (size_t i = 0; i < tids_.size(); ++i) {
-            ACE_Thread_Manager::instance()->join(tids_[i]);
-            delete reactors_[i];
-        }
-    }
-
     int open(const addr_type& local_addr,
              ACE_Reactor* reactor,
              int flags,
@@ -153,7 +210,7 @@ public:
             peer_acceptor_.close();
         }
 
-        if (!create_reactors())
+        if (!loops_.open(ACE_OS::num_processors()))
             return -1;
 
         ACE_DEBUG((LM_DEBUG, "(%t) Acceptor\n"));
@@ -165,32 +222,11 @@ public:
         if (!sh)
             ACE_NEW_RETURN(sh, handler_type, -1);
 
-        sh->reactor(reactors_[i_]);
-        i_ = (i_ + 1) % reactors_.size();
+        sh->reactor(loops_.reactor());
         return 0;
     }
 protected:
-    bool create_reactors()
-    {
-        const int n = ACE_OS::num_processors();
-        reactors_.reserve(n);
-        tids_.reserve(n);
-
-        for (int i = 0; i < n; ++i) {
-            ACE_thread_t tid = 0;
-            if (ACE_Reactor* const r = make_reactor_event_loop(tid)) {
-                tids_.push_back(tid);
-                reactors_.push_back(r);
-            }
-        }
-
-        i_ = 0;
-        return true;
-    }
-
-    std::vector<ACE_Reactor*> reactors_;
-    std::vector<ACE_thread_t> tids_;
-    size_t i_;
+    Event_Loop_Manager loops_;
 };
 
 int ACE_TMAIN(int argc, ACE_TCHAR* argv[])
