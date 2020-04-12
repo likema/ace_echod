@@ -5,10 +5,19 @@
 #include <ace/SOCK_Stream.h>
 #include <ace/Svc_Handler.h>
 #include <ace/Select_Reactor.h>
-#include <ace/Manual_Event.h>
+
+#ifdef _WIN32
+#   include <ace/WFMO_Reactor.h>
+#else // !_WIN32
+#   include <ace/Dev_Poll_Reactor.h>
+#endif // _WIN32
+
+#define DEFAULT_REACTOR_TYPE "select"
 
 #define IPV6_ONLY_OPT ACE_TEXT("ipv6only")
 #define IPV6_ONLY_OPT_LEN (sizeof(IPV6_ONLY_OPT) / sizeof(ACE_TCHAR) - 1)
+
+typedef ACE_Reactor* (*make_reactor_t) ();
 
 template <typename T>
 ACE_Reactor* make_reactor()
@@ -26,12 +35,23 @@ ACE_Reactor* make_reactor()
     return reactor;
 }
 
-static ACE_THR_FUNC_RETURN event_loop(void* p)
+make_reactor_t get_reactor_factory(const ACE_TCHAR* type)
 {
-    ACE_Reactor* const reactor = (ACE_Reactor*) p;
-    if (!reactor)
-        return 0;
+    if (!ACE_OS::strcmp(type, "select")) {
+        return make_reactor<ACE_Select_Reactor>;
+#ifdef ACE_WIN32
+    } else if (!ACE_OS::strcmp(type, "wfmo")) {
+        return make_reactor<ACE_WFMO_Reactor>;
+#endif // ACE_WIN32
+    } else if (!ACE_OS::strcmp(type, "dev_poll")) {
+        return make_reactor<ACE_Dev_Poll_Reactor>;
+    }
 
+    return 0;
+}
+
+static ACE_THR_FUNC_RETURN event_loop(ACE_Reactor* reactor)
+{
     reactor->owner(ACE_OS::thr_self());
     while (!reactor->reactor_event_loop_done()) {
         reactor->run_reactor_event_loop();
@@ -40,13 +60,15 @@ static ACE_THR_FUNC_RETURN event_loop(void* p)
     return 0;
 }
 
-static ACE_Reactor* make_reactor_event_loop(ACE_thread_t& tid)
+static ACE_Reactor* make_reactor_event_loop(make_reactor_t maker, ACE_thread_t& tid)
 {
-    ACE_Reactor* const reactor = make_reactor <ACE_Select_Reactor> ();
+    ACE_Reactor* const reactor = maker();
     if (!reactor)
         return 0;
 
-    if (ACE_Thread_Manager::instance()->spawn(event_loop, reactor,
+    if (ACE_Thread_Manager::instance()->spawn(
+                (ACE_THR_FUNC) event_loop,
+                reactor,
                 THR_NEW_LWP | THR_JOINABLE | THR_INHERIT_SCHED,
                 &tid) == -1) {
         ACE_ERROR_RETURN((LM_ERROR,
@@ -61,7 +83,7 @@ static ACE_Reactor* make_reactor_event_loop(ACE_thread_t& tid)
 class Event_Loop_Manager
 {
 public:
-    Event_Loop_Manager(): reactors_(0), tids_(0), n_(0), i_(0)
+    Event_Loop_Manager(): reactors_(0), tids_(0), threads_(0), current_(0)
     {
     }
 
@@ -70,54 +92,65 @@ public:
         close();
     }
 
-    bool open(int n)
+    bool open(const char* reactor_type, unsigned threads)
     {
         close();
 
         ACE_Reactor** r;
-        ACE_NEW_RETURN(r, ACE_Reactor*[n], false);
+        ACE_NEW_RETURN(r, ACE_Reactor*[threads], false);
         reactors_.reset(r);
-        memset(r, 0, sizeof(ACE_Reactor*) * n);
+        memset(r, 0, sizeof(ACE_Reactor*) * threads);
 
         ACE_thread_t* t;
-        ACE_NEW_RETURN(t, ACE_thread_t[n], false);
+        ACE_NEW_RETURN(t, ACE_thread_t[threads], false);
         tids_.reset(t);
-        memset(t, 0, sizeof(ACE_thread_t*) * n);
+        memset(t, 0, sizeof(ACE_thread_t*) * threads);
 
-        n_ = n;
+        threads_ = threads;
 
-        for (int i = 0; i < n_; ++i) {
-            reactors_[i] = make_reactor_event_loop(tids_[i]);
+        make_reactor_t maker = get_reactor_factory(reactor_type);
+        if (!maker)
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("Invalid reactor type %s\n"),
+                              reactor_type),
+                              false);
+
+        ACE_DEBUG((LM_DEBUG,
+                   "Event loop: reactor type %s, threads %d\n",
+                   reactor_type, threads_));
+
+        for (unsigned i = 0; i < threads_; ++i) {
+            reactors_[i] = make_reactor_event_loop(maker, tids_[i]);
         }
 
-        i_ = 0;
+        current_ = 0;
         return true;
     }
 
     void close()
     {
-        for (int i = 0; i < n_; ++i) {
+        for (unsigned i = 0; i < threads_; ++i) {
             ACE_Thread_Manager::instance()->join(tids_[i]);
             delete reactors_[i];
             reactors_[i] = 0;
         }
 
-        i_ = n_ = 0;
+        current_ = threads_ = 0;
         reactors_.reset();
         tids_.reset();
     }
 
     ACE_Reactor* reactor()
     {
-        ACE_Reactor* r = reactors_[i_];
-        i_ = (i_ + 1) % n_;
+        ACE_Reactor* r = reactors_[current_];
+        current_ = (current_ + 1) % threads_;
         return r;
     }
 protected:
     ACE_Auto_Basic_Array_Ptr<ACE_Reactor*> reactors_;
     ACE_Auto_Basic_Array_Ptr<ACE_thread_t> tids_;
-    int n_;
-    int i_;
+    unsigned threads_;
+    unsigned current_;
 };
 
 class Echo_Handler: public ACE_Svc_Handler<ACE_SOCK_STREAM, ACE_NULL_SYNCH>
@@ -170,7 +203,8 @@ public:
              int flags,
              int use_select,
              int reuse_addr,
-             int ipv6_only)
+             int ipv6_only,
+             const char* reactor_type = 0)
     {
         flags_ = flags;
         use_select_ = use_select;
@@ -198,7 +232,7 @@ public:
             peer_acceptor_.close();
         }
 
-        if (!loops_.open(ACE_OS::num_processors()))
+        if (!loops_.open(reactor_type, ACE_OS::num_processors()))
             return -1;
 
         ACE_DEBUG((LM_DEBUG, "(%t) Acceptor\n"));
@@ -226,6 +260,10 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[])
         return 1;
     }
 
+    const char* reactor_type = ACE_OS::getenv("REACTOR_TYPE");
+    if (!reactor_type)
+        reactor_type = DEFAULT_REACTOR_TYPE;
+
     ACE_LOG_MSG->sync(ACE_TEXT("echod"));
     ACE_LOG_MSG->set_flags(ACE_Log_Msg::VERBOSE);
     const int n = argc - 1;
@@ -249,7 +287,8 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[])
                               0,
                               1,
                               1,
-                              ipv6_only) < 0) {
+                              ipv6_only,
+                              reactor_type) < 0) {
             ACE_ERROR((LM_ERROR,
                        ACE_TEXT("Unable to lisent '%s', %m\n"),
                        addr.get()));
