@@ -26,23 +26,13 @@ ACE_Reactor* make_reactor()
     return reactor;
 }
 
-struct Event_Loop_Arg {
-    ACE_Reactor* reactor;
-    ACE_Manual_Event* evt;
-};
-
 static ACE_THR_FUNC_RETURN event_loop(void* p)
 {
-    ACE_Reactor* const reactor = make_reactor <ACE_Select_Reactor> ();
+    ACE_Reactor* const reactor = (ACE_Reactor*) p;
     if (!reactor)
         return 0;
 
-    {
-        Event_Loop_Arg* arg = (Event_Loop_Arg*) p;
-        arg->reactor = reactor;
-        arg->evt->signal();
-    }
-
+    reactor->owner(ACE_OS::thr_self());
     while (!reactor->reactor_event_loop_done()) {
         reactor->run_reactor_event_loop();
     }
@@ -52,12 +42,11 @@ static ACE_THR_FUNC_RETURN event_loop(void* p)
 
 static ACE_Reactor* make_reactor_event_loop(ACE_thread_t& tid)
 {
-    Event_Loop_Arg arg;
-    ACE_Manual_Event evt;
-    arg.reactor = 0;
-    arg.evt = &evt;
+    ACE_Reactor* const reactor = make_reactor <ACE_Select_Reactor> ();
+    if (!reactor)
+        return 0;
 
-    if (ACE_Thread_Manager::instance()->spawn(event_loop, &arg,
+    if (ACE_Thread_Manager::instance()->spawn(event_loop, reactor,
                 THR_NEW_LWP | THR_JOINABLE | THR_INHERIT_SCHED,
                 &tid) == -1) {
         ACE_ERROR_RETURN((LM_ERROR,
@@ -66,8 +55,7 @@ static ACE_Reactor* make_reactor_event_loop(ACE_thread_t& tid)
                           0);
     }
 
-    evt.wait();
-    return arg.reactor;
+    return reactor;
 }
 
 class Event_Loop_Manager
